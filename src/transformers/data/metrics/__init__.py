@@ -83,3 +83,6 @@ if _has_sklearn:
             return {"acc": simple_accuracy(preds, labels)}
         else:
             raise KeyError(task_name)
+
+    def ir_compute_metrics(preds, labels):
+        return {"acc": simple_accuracy(preds, labels)}

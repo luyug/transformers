@@ -69,6 +69,10 @@ from .data import (
     xnli_output_modes,
     xnli_processors,
     xnli_tasks_num_labels,
+    ir_convert_examples_to_features,
+    ir_output_modes,
+    ir_processors,
+    ir_tasks_num_labels,
 )
 
 # Files and general utilities
@@ -144,7 +148,7 @@ logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
 
 if is_sklearn_available():
-    from .data import glue_compute_metrics, xnli_compute_metrics
+    from .data import glue_compute_metrics, xnli_compute_metrics, ir_compute_metrics
 
 
 # Modeling
