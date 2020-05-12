@@ -4,13 +4,12 @@
 #SBATCH -n 1 # 1 task requested
 #SBATCH --mem=180000 # Memory - Use 32G
 #SBATCH --time=0 # No time limit
-#SBATCH -o train-ret.slurm  # send stdout to outfile
-#SBATCH --gres=gpu:1 # Use 1 GPUs
+#SBATCH -o /bos/tmp16/luyug/outputs/tmb/logs/train-rmb.out
+#SBATCH --gres=gpu:4 # Use 1 GPUs
 #SBATCH -p gpu
-#SBATCH --nodelist=boston-2-29
 
 marco_pair_dir=/bos/tmp16/luyug/data/marco/pt-pair-2M
-save_dir=/bos/tmp16/luyug/outputs/tmp/model
+save_dir=/bos/tmp16/luyug/outputs/tmb/models/rmb
 
 set -e
 python run_retrieval.py \
@@ -28,4 +27,5 @@ python run_retrieval.py \
   --save_steps 1000 \
   --logging_steps 1000 \
   --evaluate_during_training \
-  --warmup_steps 1000
+  --warmup_steps 1000 \
+  --masking rmb

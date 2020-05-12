@@ -4,26 +4,27 @@
 #SBATCH -n 1 # 1 task requested
 #SBATCH --mem=96000 # Memory - Use 32G
 #SBATCH --time=6:00:00 # No time limit
-#SBATCH -o score-ret.slurm
+#SBATCH -o /bos/tmp16/luyug/outputs/tmb/logs/score-rmb.out
 #SBATCH --gres=gpu:4 # Use 1 GPUs
 #SBATCH -p gpu
 test_pair_dir=/bos/tmp16/luyug/data/marco/test_pair/6980-no-filter
-output_dir=/bos/tmp16/luyug/outputs/tmp/model
-ranking_dir=/bos/tmp16/luyug/outputs/tmp/ranking
+output_dir=/bos/tmp16/luyug/outputs/tmb/models/rmb
+ranking_dir=/bos/tmp16/luyug/outputs/tmb/rankings/rmb
 
 mkdir $ranking_dir
 
 set -e
-python run_reduced_bert.py \
+python run_retrieval.py \
   --model_type bert \
   --model_name_or_path $output_dir \
-  --task_name fmarco \
+  --task_name marco \
   --do_score \
   --do_lower_case \
   --data_dir $test_pair_dir \
   --max_seq_length 128 \
   --per_gpu_eval_batch_size 128 \
-  --output_dir $output_dir
+  --output_dir $output_dir \
+  --masking rmb
 
 score_file_id=6980.all
 

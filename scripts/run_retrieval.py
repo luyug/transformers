@@ -101,6 +101,68 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
+def same_token_masking(token_ids: torch.Tensor, mask: torch.BoolTensor):
+    from_tokens = token_ids.unsqueeze(-1)  # B * L * 1
+    to_tokens = token_ids.unsqueeze(1)  # B * 1 * L
+    tm_mask = from_tokens == to_tokens
+    return tm_mask & mask.unsqueeze(1)
+
+
+def from_cls_masking(mask: torch.BoolTensor):
+    bsz, seq_len = mask.shape
+    no_attn_mask = torch.zeros(bsz, seq_len, seq_len, device=mask.device, dtype=torch.bool)
+    no_attn_mask[:, 0] = 1
+    return no_attn_mask & mask.unsqueeze(1)
+
+
+def same_seg_masking(seg_ids: torch.Tensor, mask: torch.BoolTensor):
+    from_seg = seg_ids.unsqueeze(-1)  # B * L * 1
+    to_seg = seg_ids.unsqueeze(1)  # B * 1 * L
+    seg_mask = from_seg == to_seg
+    return seg_mask & mask.unsqueeze(1)
+
+
+def token_pair_masking(offset1: int, offset2: int, seg_ids: torch.Tensor, mask: torch.BoolTensor):
+    seg_2nd_idx = ((seg_ids == 0) & mask).sum(-1) + offset2  # B
+    seg_1st_idx = torch.ones_like(seg_2nd_idx) + offset1  # B
+
+    bsz, seq_len = mask.shape
+    no_attn_mask = torch.zeros(bsz, seq_len, seq_len, device=mask.device, dtype=torch.bool)
+    no_attn_mask[torch.arange(0, bsz, dtype=torch.long), seg_1st_idx, seg_2nd_idx] = 1
+    no_attn_mask[torch.arange(0, bsz, dtype=torch.long), seg_2nd_idx, seg_1st_idx] = 1
+
+    return no_attn_mask & mask.unsqueeze(1)
+
+
+def tmb_masking(token_ids: torch.Tensor, seg_ids: torch.Tensor, mask: torch.BoolTensor) -> torch.BoolTensor:
+    same_token_mask = same_token_masking(token_ids, mask)
+    same_segment_mask = same_seg_masking(seg_ids, mask)
+    from_cls_mask = from_cls_masking(mask)
+    return same_token_mask | same_segment_mask | from_cls_mask
+
+
+def cls_masking(seg_ids: torch.Tensor, mask: torch.BoolTensor, **kwargs) -> torch.BoolTensor:
+    same_segment_mask = same_seg_masking(seg_ids, mask)
+    from_cls_mask = from_cls_masking(mask)
+    return same_segment_mask | from_cls_mask
+
+
+def rmb_masking(seg_ids: torch.Tensor = None, mask: torch.BoolTensor = None, offset1: int = 1, offset2: int = 1, **kwargs):
+    same_segment_mask = same_seg_masking(seg_ids, mask)
+    from_cls_mask = from_cls_masking(mask)
+    token_pair_mask = token_pair_masking(offset1, offset2, seg_ids, mask)
+    return same_segment_mask | from_cls_mask | token_pair_mask
+
+
+masking_functions = {
+    "tmb": tmb_masking,
+    "cmb": cls_masking,
+    "rmb": rmb_masking,
+}
+
+func_masking = None
+
+
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
     if args.local_rank in [-1, 0]:
@@ -205,7 +267,12 @@ def train(args, train_dataset, model, tokenizer):
 
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
-            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
+
+            # build TM mask
+            initial_masks = {"token_ids": batch[0], "mask": batch[1].bool(), "seg_ids": batch[2]}
+            matching_mask = func_masking(**initial_masks).float()
+
+            inputs = {"input_ids": batch[0], "attention_mask": matching_mask, "labels": batch[3]}
             if args.model_type != "distilbert":
                 inputs["token_type_ids"] = (
                     batch[2] if args.model_type in ["bert", "xlnet", "albert"] else None
@@ -323,7 +390,11 @@ def evaluate(args, model, tokenizer, prefix=""):
             batch = tuple(t.to(args.device) for t in batch)
 
             with torch.no_grad():
-                inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
+                # build TM mask
+                initial_masks = {"token_ids": batch[0], "mask": batch[1].bool(), "seg_ids": batch[2]}
+                matching_mask = func_masking(**initial_masks).float()
+
+                inputs = {"input_ids": batch[0], "attention_mask": matching_mask, "labels": batch[3]}
                 if args.model_type != "distilbert":
                     inputs["token_type_ids"] = (
                         batch[2] if args.model_type in ["bert", "xlnet", "albert"] else None
@@ -392,7 +463,11 @@ def score(args, model, tokenizer, prefix="", score_idx=1):
             batch = tuple(t.to(args.device) for t in batch)
 
             with torch.no_grad():
-                inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
+                # build TM mask
+                initial_masks = {"token_ids": batch[0], "mask": batch[1].bool(), "seg_ids": batch[2]}
+                matching_mask = func_masking(**initial_masks).float()
+
+                inputs = {"input_ids": batch[0], "attention_mask": matching_mask, "labels": batch[3]}
                 if args.model_type != "distilbert":
                     inputs["token_type_ids"] = (
                         batch[2] if args.model_type in ["bert", "xlnet", "albert"] else None
@@ -610,7 +685,12 @@ def main():
     parser.add_argument("--server_ip", type=str, default="", help="For distant debugging.")
     parser.add_argument("--server_port", type=str, default="", help="For distant debugging.")
 
+    parser.add_argument('--masking', type=str, default='tmb')
+
     args = parser.parse_args()
+
+    global func_masking
+    func_masking = masking_functions[args.masking]
 
     if (
             os.path.exists(args.output_dir)
