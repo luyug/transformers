@@ -94,6 +94,8 @@ class PretrainedConfig(object):
         self.label2id = kwargs.pop("label2id", dict(zip(self.id2label.values(), self.id2label.keys())))
         self.label2id = dict((key, int(value)) for key, value in self.label2id.items())
 
+        self.n_anchors = kwargs.pop('n_anchors', 1)
+
         # Additional attributes without default values
         for key, value in kwargs.items():
             try:

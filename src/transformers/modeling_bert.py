@@ -1108,10 +1108,11 @@ class BertForSequenceClassification(BertPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
+        self.n_anchors = config.n_anchors
 
         self.bert = BertModel(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.classifier = nn.Linear(config.hidden_size, self.config.num_labels)
+        self.classifier = nn.Linear(config.hidden_size, self.config.num_labels + (self.n_anchors - 1))
 
         self.init_weights()
 
@@ -1180,6 +1181,9 @@ class BertForSequenceClassification(BertPreTrainedModel):
 
         pooled_output = self.dropout(pooled_output)
         logits = self.classifier(pooled_output)
+
+        anchor_max, _ = logits[:, :self.n_anchors].max(-1)
+        logits = torch.stack((anchor_max, logits[:, -1]), 1)
 
         outputs = (logits,) + outputs[2:]  # add hidden states and attention if they are here
 
