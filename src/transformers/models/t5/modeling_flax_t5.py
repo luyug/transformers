@@ -14,7 +14,6 @@
 # limitations under the License.
 """ Flax T5 model. """
 
-
 import copy
 from typing import Callable, Optional, Tuple
 
@@ -25,7 +24,6 @@ import jax
 import jax.numpy as jnp
 from flax.core.frozen_dict import FrozenDict, unfreeze
 from flax.linen import combine_masks, make_causal_mask
-from flax.linen.attention import dot_product_attention_weights
 from jax.random import PRNGKey
 
 from ...file_utils import add_start_docstrings, add_start_docstrings_to_model_forward, replace_return_docstrings
@@ -46,12 +44,69 @@ from ...modeling_flax_utils import (
 from ...utils import logging
 from .configuration_t5 import T5Config
 
-
 logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "t5-small"
 _CONFIG_FOR_DOC = "T5Config"
 _TOKENIZER_FOR_DOC = "T5Tokenizer"
+
+Dtype = jnp.dtype
+Array = jnp.ndarray
+
+
+def dot_product_attention_weights(
+        query: Array,
+        key: Array,
+        bias: Optional[Array] = None,
+        mask: Optional[Array] = None,
+        dropout_rng: Optional[PRNGKey] = None,
+        dropout_rate: float = 0.,
+        deterministic: bool = False,
+        float32_logits: bool = True,
+        dtype: Dtype = jnp.float32,
+        precision: Optional[jax.lax.Precision] = None
+):
+    assert query.ndim == key.ndim, 'q, k must have same rank.'
+    assert query.shape[:-3] == key.shape[:-3], (
+        'q, k batch dims must match.')
+    assert query.shape[-2] == key.shape[-2], (
+        'q, k num_heads must match.')
+    assert query.shape[-1] == key.shape[-1], 'q, k depths must match.'
+
+    # calculate attention matrix
+    depth = query.shape[-1]
+    query = query / jnp.sqrt(depth).astype(dtype)
+
+    if float32_logits:
+        query = query.astype(jnp.float32)
+        key = key.astype(jnp.float32)
+
+    # attn weight shape is (batch..., num_heads, q_length, kv_length)
+    attn_weights = jnp.einsum('...qhd,...khd->...hqk', query, key,
+                              precision=precision)
+
+    # apply attention bias: masking, dropout, proximity bias, etc.
+    if bias is not None:
+        attn_weights = attn_weights + bias.astype(attn_weights.dtype)
+    # apply attention mask
+    if mask is not None:
+        big_neg = jnp.finfo(dtype).min
+        attn_weights = jnp.where(mask, attn_weights, big_neg)
+
+    # normalize the attention weights
+    attn_weights = jax.nn.softmax(attn_weights).astype(dtype)
+
+    # apply attention dropout
+    if not deterministic and dropout_rate > 0.:
+        keep_prob = 1.0 - dropout_rate
+        dropout_shape = list(attn_weights.shape)
+        dropout_shape[-2] = 1
+        keep = jax.random.bernoulli(dropout_rng, keep_prob, dropout_shape)
+        multiplier = (keep.astype(attn_weights.dtype) /
+                      jnp.asarray(keep_prob, dtype=dtype))
+        attn_weights = attn_weights * multiplier
+
+    return attn_weights
 
 
 # Copied from transformers.models.bart.modeling_flax_bart.shift_tokens_right
@@ -257,7 +312,7 @@ class FlaxT5Attention(nn.Module):
 
         # The other half of the buckets are for logarithmically bigger bins in positions up to max_distance
         relative_position_if_large = max_exact + (
-            jnp.log(relative_position / max_exact) / jnp.log(max_distance / max_exact) * (num_buckets - max_exact)
+                jnp.log(relative_position / max_exact) / jnp.log(max_distance / max_exact) * (num_buckets - max_exact)
         )
         relative_position_if_large = jnp.clip(relative_position_if_large, a_max=num_buckets - 1)
 
@@ -321,7 +376,7 @@ class FlaxT5Attention(nn.Module):
         return key, value, attention_mask
 
     def _create_position_bias(
-        self, key_states, query_states, attention_mask, init_cache, seq_length, causal_attention_mask_shift
+            self, key_states, query_states, attention_mask, init_cache, seq_length, causal_attention_mask_shift
     ):
         cache_is_filled = self.causal and self.has_variable("cache", "cached_key") and (not init_cache)
         key_length = key_states.shape[1]
@@ -345,15 +400,15 @@ class FlaxT5Attention(nn.Module):
         return position_bias
 
     def __call__(
-        self,
-        hidden_states,
-        attention_mask=None,
-        key_value_states=None,
-        position_bias=None,
-        use_cache=False,
-        output_attentions=False,
-        deterministic=True,
-        init_cache=False,
+            self,
+            hidden_states,
+            attention_mask=None,
+            key_value_states=None,
+            position_bias=None,
+            use_cache=False,
+            output_attentions=False,
+            deterministic=True,
+            init_cache=False,
     ):
         """
         Self-attention (if key_value_states is None) or attention over source sentence (provided by key_value_states).
@@ -437,7 +492,6 @@ class FlaxT5Attention(nn.Module):
             bias=position_bias,
             dropout_rng=dropout_rng,
             dropout_rate=self.dropout,
-            broadcast_dropout=True,
             deterministic=deterministic,
             dtype=self.dtype,
         )
@@ -475,13 +529,13 @@ class FlaxT5LayerSelfAttention(nn.Module):
         self.dropout = nn.Dropout(self.config.dropout_rate)
 
     def __call__(
-        self,
-        hidden_states,
-        attention_mask=None,
-        position_bias=None,
-        output_attentions=False,
-        deterministic=True,
-        init_cache=False,
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_bias=None,
+            output_attentions=False,
+            deterministic=True,
+            init_cache=False,
     ):
         normed_hidden_states = self.layer_norm(hidden_states)
         attention_output = self.SelfAttention(
@@ -509,13 +563,13 @@ class FlaxT5LayerCrossAttention(nn.Module):
         self.dropout = nn.Dropout(self.config.dropout_rate)
 
     def __call__(
-        self,
-        hidden_states,
-        key_value_states,
-        attention_mask=None,
-        position_bias=None,
-        output_attentions=False,
-        deterministic=True,
+            self,
+            hidden_states,
+            key_value_states,
+            attention_mask=None,
+            position_bias=None,
+            output_attentions=False,
+            deterministic=True,
     ):
         normed_hidden_states = self.layer_norm(hidden_states)
         attention_output = self.EncDecAttention(
@@ -553,17 +607,17 @@ class FlaxT5Block(nn.Module):
         self.layer += (FlaxT5LayerFF(self.config, name=str(feed_forward_index), dtype=self.dtype),)
 
     def __call__(
-        self,
-        hidden_states,
-        attention_mask=None,
-        position_bias=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        encoder_decoder_position_bias=None,
-        output_attentions=False,
-        return_dict=True,
-        deterministic=True,
-        init_cache=False,
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_bias=None,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            encoder_decoder_position_bias=None,
+            output_attentions=False,
+            return_dict=True,
+            deterministic=True,
+            init_cache=False,
     ):
         self_attention_outputs = self.layer[0](
             hidden_states,
@@ -614,17 +668,17 @@ class FlaxT5LayerCollection(nn.Module):
         )
 
     def __call__(
-        self,
-        hidden_states,
-        attention_mask=None,
-        position_bias=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        encoder_decoder_position_bias=None,
-        output_attentions=False,
-        return_dict=True,
-        deterministic=True,
-        init_cache=False,
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_bias=None,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            encoder_decoder_position_bias=None,
+            output_attentions=False,
+            return_dict=True,
+            deterministic=True,
+            init_cache=False,
     ):
         return self.layer(
             hidden_states,
@@ -651,15 +705,15 @@ class FlaxT5BlockCollection(nn.Module):
         ]
 
     def __call__(
-        self,
-        hidden_states=None,
-        attention_mask=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-        deterministic: bool = True,
-        init_cache: bool = False,
+            self,
+            hidden_states=None,
+            attention_mask=None,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            deterministic: bool = True,
+            init_cache: bool = False,
     ):
         # Prepare head mask if needed
         all_hidden_states = () if output_hidden_states else None
@@ -729,16 +783,16 @@ class FlaxT5Stack(nn.Module):
         self.dropout = nn.Dropout(self.config.dropout_rate)
 
     def __call__(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-        return_dict: bool = True,
-        deterministic: bool = True,
-        init_cache: bool = False,
+            self,
+            input_ids=None,
+            attention_mask=None,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            return_dict: bool = True,
+            deterministic: bool = True,
+            init_cache: bool = False,
     ):
         hidden_states = self.embed_tokens(input_ids)
         hidden_states = self.dropout(hidden_states, deterministic=deterministic)
@@ -769,9 +823,9 @@ class FlaxT5Stack(nn.Module):
         if not return_dict:
             if output_hidden_states:
                 return (
-                    hidden_states,
-                    all_hidden_states,
-                ) + outputs[2:]
+                           hidden_states,
+                           all_hidden_states,
+                       ) + outputs[2:]
             return (hidden_states,) + outputs[1:]
 
         return FlaxBaseModelOutputWithPastAndCrossAttentions(
@@ -854,7 +908,6 @@ T5_DECODE_INPUTS_DOCSTRING = r"""
             Whether or not to return a :class:`~transformers.file_utils.ModelOutput` instead of a plain tuple.
 """
 
-
 T5_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (:obj:`jnp.ndarray` of shape :obj:`(batch_size, sequence_length)`):
@@ -929,12 +982,12 @@ class FlaxT5PreTrainedModel(FlaxPreTrainedModel):
     module_class: nn.Module = None
 
     def __init__(
-        self,
-        config: T5Config,
-        input_shape: Tuple[int] = (1, 1),
-        seed: int = 0,
-        dtype: jnp.dtype = jnp.float32,
-        **kwargs
+            self,
+            config: T5Config,
+            input_shape: Tuple[int] = (1, 1),
+            seed: int = 0,
+            dtype: jnp.dtype = jnp.float32,
+            **kwargs
     ):
         module = self.module_class(config=config, dtype=dtype, **kwargs)
         super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype)
@@ -960,17 +1013,17 @@ class FlaxT5PreTrainedModel(FlaxPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(T5_INPUTS_DOCSTRING)
     def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        attention_mask: Optional[jnp.ndarray] = None,
-        decoder_input_ids: jnp.ndarray = None,
-        decoder_attention_mask: Optional[jnp.ndarray] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        train: bool = False,
-        params: dict = None,
-        dropout_rng: PRNGKey = None,
+            self,
+            input_ids: jnp.ndarray,
+            attention_mask: Optional[jnp.ndarray] = None,
+            decoder_input_ids: jnp.ndarray = None,
+            decoder_attention_mask: Optional[jnp.ndarray] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            train: bool = False,
+            params: dict = None,
+            dropout_rng: PRNGKey = None,
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1046,15 +1099,15 @@ class FlaxT5PreTrainedModel(FlaxPreTrainedModel):
     @add_start_docstrings(T5_ENCODE_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=FlaxBaseModelOutput, config_class=T5Config)
     def encode(
-        self,
-        input_ids: jnp.ndarray,
-        attention_mask: Optional[jnp.ndarray] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        train: bool = False,
-        params: dict = None,
-        dropout_rng: PRNGKey = None,
+            self,
+            input_ids: jnp.ndarray,
+            attention_mask: Optional[jnp.ndarray] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            train: bool = False,
+            params: dict = None,
+            dropout_rng: PRNGKey = None,
     ):
         r"""
         Returns:
@@ -1103,18 +1156,18 @@ class FlaxT5PreTrainedModel(FlaxPreTrainedModel):
     @add_start_docstrings(T5_DECODE_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=FlaxBaseModelOutputWithPastAndCrossAttentions, config_class=T5Config)
     def decode(
-        self,
-        decoder_input_ids,
-        encoder_outputs,
-        encoder_attention_mask: Optional[jnp.ndarray] = None,
-        decoder_attention_mask: Optional[jnp.ndarray] = None,
-        past_key_values: dict = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        train: bool = False,
-        params: dict = None,
-        dropout_rng: PRNGKey = None,
+            self,
+            decoder_input_ids,
+            encoder_outputs,
+            encoder_attention_mask: Optional[jnp.ndarray] = None,
+            decoder_attention_mask: Optional[jnp.ndarray] = None,
+            past_key_values: dict = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            train: bool = False,
+            params: dict = None,
+            dropout_rng: PRNGKey = None,
     ):
         r"""
         Returns:
@@ -1275,16 +1328,16 @@ class FlaxT5Module(nn.Module):
         self.decoder = FlaxT5Stack(decoder_config, embed_tokens=self.shared, dtype=self.dtype)
 
     def __call__(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        decoder_input_ids=None,
-        decoder_attention_mask=None,
-        encoder_outputs=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        deterministic: bool = True,
+            self,
+            input_ids=None,
+            attention_mask=None,
+            decoder_input_ids=None,
+            decoder_attention_mask=None,
+            encoder_outputs=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
+            deterministic: bool = True,
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1351,7 +1404,6 @@ FLAX_T5_MODEL_DOCSTRING = """
         >>> last_hidden_states = outputs.last_hidden_state
 """
 
-
 overwrite_call_docstring(FlaxT5Model, T5_INPUTS_DOCSTRING + FLAX_T5_MODEL_DOCSTRING)
 append_replace_return_docstrings(FlaxT5Model, output_type=FlaxSeq2SeqLMOutput, config_class=_CONFIG_FOR_DOC)
 
@@ -1396,16 +1448,16 @@ class FlaxT5ForConditionalGenerationModule(nn.Module):
         )
 
     def __call__(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        decoder_input_ids=None,
-        decoder_attention_mask=None,
-        encoder_outputs=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        deterministic: bool = True,
+            self,
+            input_ids=None,
+            attention_mask=None,
+            decoder_input_ids=None,
+            decoder_attention_mask=None,
+            encoder_outputs=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
+            deterministic: bool = True,
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1467,18 +1519,18 @@ class FlaxT5ForConditionalGeneration(FlaxT5PreTrainedModel):
     @add_start_docstrings(T5_DECODE_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=FlaxCausalLMOutputWithCrossAttentions, config_class=T5Config)
     def decode(
-        self,
-        decoder_input_ids,
-        encoder_outputs,
-        encoder_attention_mask: Optional[jnp.ndarray] = None,
-        decoder_attention_mask: Optional[jnp.ndarray] = None,
-        past_key_values: dict = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        train: bool = False,
-        params: dict = None,
-        dropout_rng: PRNGKey = None,
+            self,
+            decoder_input_ids,
+            encoder_outputs,
+            encoder_attention_mask: Optional[jnp.ndarray] = None,
+            decoder_attention_mask: Optional[jnp.ndarray] = None,
+            past_key_values: dict = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            train: bool = False,
+            params: dict = None,
+            dropout_rng: PRNGKey = None,
     ):
         r"""
         Returns:
@@ -1595,13 +1647,13 @@ class FlaxT5ForConditionalGeneration(FlaxT5PreTrainedModel):
         return outputs
 
     def prepare_inputs_for_generation(
-        self,
-        decoder_input_ids,
-        max_length,
-        attention_mask: Optional[jnp.DeviceArray] = None,
-        decoder_attention_mask: Optional[jnp.DeviceArray] = None,
-        encoder_outputs=None,
-        **kwargs
+            self,
+            decoder_input_ids,
+            max_length,
+            attention_mask: Optional[jnp.DeviceArray] = None,
+            decoder_attention_mask: Optional[jnp.DeviceArray] = None,
+            encoder_outputs=None,
+            **kwargs
     ):
         # initializing the cache
         batch_size, seq_length = decoder_input_ids.shape
@@ -1645,7 +1697,6 @@ FLAX_T5_CONDITIONAL_GENERATION_DOCSTRING = """
         >>> summary_ids = model.generate(inputs['input_ids']).sequences
         >>> print(tokenizer.decode(summary_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=False))
 """
-
 
 overwrite_call_docstring(
     FlaxT5ForConditionalGeneration, T5_INPUTS_DOCSTRING + FLAX_T5_CONDITIONAL_GENERATION_DOCSTRING
