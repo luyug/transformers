@@ -524,17 +524,20 @@ class FlaxPreTrainedModel(PushToHubMixin, FlaxGenerationMixin):
         # matching the weights in the model.
         mismatched_keys = []
         for key in state.keys():
-            if key in random_state and state[key].shape != random_state[key].shape:
-                if ignore_mismatched_sizes:
-                    mismatched_keys.append((key, state[key].shape, random_state[key].shape))
-                    state[key] = random_state[key]
+            if key in random_state:
+                if state[key].shape != random_state[key].shape:
+                    if ignore_mismatched_sizes:
+                        mismatched_keys.append((key, state[key].shape, random_state[key].shape))
+                        state[key] = random_state[key]
+                    else:
+                        raise ValueError(
+                            f"Trying to load the pretrained weight for {key} failed: checkpoint has shape "
+                            f"{state[key].shape} which is incompatible with the model shape {random_state[key].shape}. "
+                            "Using `ignore_mismatched_sizes=True` if you really want to load this checkpoint inside this "
+                            "model."
+                        )
                 else:
-                    raise ValueError(
-                        f"Trying to load the pretrained weight for {key} failed: checkpoint has shape "
-                        f"{state[key].shape} which is incompatible with the model shape {random_state[key].shape}. "
-                        "Using `ignore_mismatched_sizes=True` if you really want to load this checkpoint inside this "
-                        "model."
-                    )
+                    state[key] = state[key].astype(random_state[key].dtype)
 
         # add missing keys as random parameters
         for missing_key in missing_keys:
