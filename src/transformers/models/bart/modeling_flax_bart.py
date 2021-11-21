@@ -26,7 +26,6 @@ import jax
 import jax.numpy as jnp
 from flax.core.frozen_dict import FrozenDict, unfreeze
 from flax.linen import combine_masks, make_causal_mask
-from flax.linen.attention import dot_product_attention_weights
 from jax import lax
 from jax.random import PRNGKey
 
@@ -237,6 +236,63 @@ def shift_tokens_right(input_ids: np.array, pad_token_id: int, decoder_start_tok
     shifted_input_ids = np.where(shifted_input_ids == -100, pad_token_id, shifted_input_ids)
     return shifted_input_ids
 
+Dtype = jnp.dtype
+Array = jnp.ndarray
+
+
+def dot_product_attention_weights(
+        query: Array,
+        key: Array,
+        bias: Optional[Array] = None,
+        mask: Optional[Array] = None,
+        dropout_rng: Optional[PRNGKey] = None,
+        dropout_rate: float = 0.,
+        deterministic: bool = False,
+        float32_logits: bool = True,
+        dtype: Dtype = jnp.float32,
+        precision: Optional[jax.lax.Precision] = None
+):
+    assert query.ndim == key.ndim, 'q, k must have same rank.'
+    assert query.shape[:-3] == key.shape[:-3], (
+        'q, k batch dims must match.')
+    assert query.shape[-2] == key.shape[-2], (
+        'q, k num_heads must match.')
+    assert query.shape[-1] == key.shape[-1], 'q, k depths must match.'
+
+    # calculate attention matrix
+    depth = query.shape[-1]
+    query = query / jnp.sqrt(depth).astype(dtype)
+
+    if float32_logits:
+        query = query.astype(jnp.float32)
+        key = key.astype(jnp.float32)
+
+    # attn weight shape is (batch..., num_heads, q_length, kv_length)
+    attn_weights = jnp.einsum('...qhd,...khd->...hqk', query, key,
+                              precision=precision)
+
+    # apply attention bias: masking, dropout, proximity bias, etc.
+    if bias is not None:
+        attn_weights = attn_weights + bias.astype(attn_weights.dtype)
+    # apply attention mask
+    if mask is not None:
+        big_neg = jnp.finfo(dtype).min
+        attn_weights = jnp.where(mask, attn_weights, big_neg)
+
+    # normalize the attention weights
+    attn_weights = jax.nn.softmax(attn_weights).astype(dtype)
+
+    # apply attention dropout
+    if not deterministic and dropout_rate > 0.:
+        keep_prob = 1.0 - dropout_rate
+        dropout_shape = list(attn_weights.shape)
+        dropout_shape[-2] = 1
+        keep = jax.random.bernoulli(dropout_rng, keep_prob, dropout_shape)
+        multiplier = (keep.astype(attn_weights.dtype) /
+                      jnp.asarray(keep_prob, dtype=dtype))
+        attn_weights = attn_weights * multiplier
+
+    return attn_weights
 
 class FlaxBartAttention(nn.Module):
     config: BartConfig
@@ -392,7 +448,6 @@ class FlaxBartAttention(nn.Module):
             bias=attention_bias,
             dropout_rng=dropout_rng,
             dropout_rate=self.dropout,
-            broadcast_dropout=True,
             deterministic=deterministic,
             dtype=self.dtype,
             precision=None,
