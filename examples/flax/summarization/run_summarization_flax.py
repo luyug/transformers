@@ -727,7 +727,7 @@ def main():
     state = state.replicate()
 
     del model._params
-    model.params = None
+    model._params = None
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
