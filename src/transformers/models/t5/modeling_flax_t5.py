@@ -1444,7 +1444,7 @@ class FlaxT5ForConditionalGenerationModule(nn.Module):
             self.config.vocab_size,
             use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_factor),
-            dtype=self.dtype,
+            dtype=jnp.float32,
         )
 
     def __call__(
