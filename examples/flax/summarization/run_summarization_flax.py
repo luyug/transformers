@@ -739,13 +739,13 @@ def main():
     train_time = 0
     epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
     pbar = iter(tqdm(range(total_opt_steps), total=total_opt_steps))
-    train_metrics = []
     for epoch in epochs:
         # ======================== Training ================================
         train_start = time.time()
 
         # Create sampling rng
         rng, input_rng = jax.random.split(rng)
+        train_metrics = []
 
         # Generate an epoch by shuffling sampling indices from the train dataset
         train_loader = data_loader(input_rng, train_dataset, train_batch_size, shuffle=True)
@@ -755,20 +755,11 @@ def main():
             cur_step = epoch * (len(train_dataset) // opt_train_batch_size) + (
                         step // training_args.gradient_accumulation_steps)
             state, train_metric = p_train_step(state, batch)
-            train_metrics.append(train_metric)
             if (step+1) % training_args.gradient_accumulation_steps == 0:
                 _ = next(pbar)
-                if cur_step % training_args.logging_steps == 0 and cur_step > 0:
-                    train_metrics = get_metrics(train_metrics)
-                    logger.info(
-                        f"Step... ({cur_step} | Loss: {train_metrics['loss'].mean()}, Learning Rate: {train_metrics['learning_rate'].mean()})",
-                    )
-                    train_metrics = []
 
         train_time += time.time() - train_start
-
         train_metric = unreplicate(train_metric)
-
         epochs.write(
             f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss']}, Learning Rate: {train_metric['learning_rate']})"
         )
