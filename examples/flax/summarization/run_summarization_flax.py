@@ -78,16 +78,16 @@ class AccumulateGrad(optax.MultiSteps):
     def update(self, grads: Any, state: MultiStepsState, params: Any = None):
         """Accumulates gradients and proposes non-zero updates every `k_steps`."""
         k_steps = self._every_k_schedule(state.gradient_step)
-        if self._use_grad_mean:
-            grads = jax.tree_map(lambda x: x / k_steps, grads)
         acc_grads = jax.tree_util.tree_multimap(lambda a, b: a + b, grads,
                                                 state.acc_grads)
 
         def final_step(args):
             del args
-            grads_for_update = acc_grads
+            if self._use_grad_mean:
+                grads_for_update = jax.tree_map(lambda x: x / k_steps, acc_grads)
+            else:
+                grads_for_update = acc_grads
             grads_for_update = jax.lax.pmean(grads_for_update, "batch")
-
             updates, new_inner_state = self._opt.update(
                 grads_for_update, state.inner_opt_state, params=params)
             new_state = MultiStepsState(mini_step=jnp.zeros([], dtype=jnp.int64),
