@@ -726,12 +726,15 @@ def main():
     # Replicate the train state on each device
     state = state.replicate()
 
+    del model._params
+    model.params = None
+
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {num_epochs}")
     logger.info(f"  Instantaneous batch size per device = {training_args.per_device_train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel & distributed) = {train_batch_size}")
-    logger.info(f"  Total optimization steps = {opt_steps_per_epoch}")
+    logger.info(f"  Total optimization steps = {total_opt_steps}")
 
     train_time = 0
     epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
