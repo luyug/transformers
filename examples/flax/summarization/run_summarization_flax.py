@@ -25,12 +25,13 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Any
 
 import datasets
 import nltk  # Here to have a nice missing dependency error message early on
 import numpy as np
 from datasets import Dataset, load_dataset, load_metric
+from optax._src.wrappers import MultiStepsState, _zeros_tree_like
 from tqdm import tqdm
 
 import jax
@@ -72,6 +73,44 @@ except (LookupError, OSError):
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
+
+class AccumulateGrad(optax.MultiSteps):
+    def update(self, grads: Any, state: MultiStepsState, params: Any = None):
+        """Accumulates gradients and proposes non-zero updates every `k_steps`."""
+        k_steps = self._every_k_schedule(state.gradient_step)
+        if self._use_grad_mean:
+            grads = jax.tree_map(lambda x: x / k_steps, grads)
+        acc_grads = jax.tree_util.tree_multimap(lambda a, b: a + b, grads,
+                                                state.acc_grads)
+
+        def final_step(args):
+            del args
+            grads_for_update = acc_grads
+            grads_for_update = jax.lax.pmean(grads_for_update, "batch")
+
+            updates, new_inner_state = self._opt.update(
+                grads_for_update, state.inner_opt_state, params=params)
+            new_state = MultiStepsState(mini_step=jnp.zeros([], dtype=jnp.int64),
+                                        gradient_step=state.gradient_step + 1,
+                                        inner_opt_state=new_inner_state,
+                                        acc_grads=_zeros_tree_like(acc_grads))
+            return updates, new_state
+
+        def mid_step(args):
+            del args
+            updates_shape_dtype, _ = jax.eval_shape(
+                self._opt.update, acc_grads, state.inner_opt_state, params=params)
+            updates = jax.tree_map(lambda sd: jnp.zeros(sd.shape, sd.dtype),
+                                   updates_shape_dtype)
+            new_state = MultiStepsState(mini_step=state.mini_step + 1,
+                                        gradient_step=state.gradient_step,
+                                        inner_opt_state=state.inner_opt_state,
+                                        acc_grads=acc_grads)
+            return updates, new_state
+
+        updates, new_state = jax.lax.cond(
+            state.mini_step < k_steps - 1, (), mid_step, (), final_step)
+        return updates, new_state
 
 @dataclass
 class ModelArguments:
@@ -279,11 +318,9 @@ def write_metric(summary_writer, train_metrics, eval_metrics, train_time, step):
 
 
 def create_learning_rate_fn(
-    train_ds_size: int, train_batch_size: int, num_train_epochs: int, num_warmup_steps: int, learning_rate: float
+    num_train_steps: int, num_warmup_steps: int, learning_rate: float
 ) -> Callable[[int], jnp.array]:
     """Returns a linear warmup, linear_decay learning rate function."""
-    steps_per_epoch = train_ds_size // train_batch_size
-    num_train_steps = steps_per_epoch * num_train_epochs
     warmup_fn = optax.linear_schedule(init_value=0.0, end_value=learning_rate, transition_steps=num_warmup_steps)
     decay_fn = optax.linear_schedule(
         init_value=learning_rate, end_value=0, transition_steps=num_train_steps - num_warmup_steps
@@ -302,6 +339,7 @@ def main():
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+        training_args: TrainingArguments
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
@@ -577,15 +615,15 @@ def main():
     num_epochs = int(training_args.num_train_epochs)
     train_batch_size = int(training_args.per_device_train_batch_size) * jax.device_count()
     eval_batch_size = int(training_args.per_device_eval_batch_size) * jax.device_count()
-    steps_per_epoch = len(train_dataset) // train_batch_size
-    total_train_steps = steps_per_epoch * num_epochs
 
-    # Create learning rate schedule
+    opt_train_batch_size = train_batch_size * training_args.gradient_accumulation_steps
+    opt_steps_per_epoch = len(train_dataset) // opt_train_batch_size
+    steps_per_epoch = opt_steps_per_epoch * training_args.gradient_accumulation_steps
+    total_opt_steps = opt_steps_per_epoch * num_epochs
+
     linear_decay_lr_schedule_fn = create_learning_rate_fn(
-        len(train_dataset),
-        train_batch_size,
-        training_args.num_train_epochs,
-        training_args.warmup_steps,
+        total_opt_steps,
+        int(total_opt_steps * 0.1),
         training_args.learning_rate,
     )
 
@@ -604,18 +642,13 @@ def main():
         flat_mask = {path: (path[-1] != "bias" and path[-2:] not in layer_norm_params) for path in flat_params}
         return traverse_util.unflatten_dict(flat_mask)
 
-    # create adam optimizer
-    adamw = optax.adamw(
+    adafactor = optax.adafactor(
         learning_rate=linear_decay_lr_schedule_fn,
-        b1=training_args.adam_beta1,
-        b2=training_args.adam_beta2,
-        eps=training_args.adam_epsilon,
-        weight_decay=training_args.weight_decay,
-        mask=decay_mask_fn,
     )
+    adafactor = AccumulateGrad(adafactor, training_args.gradient_accumulation_steps)
 
     # Setup train state
-    state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw, dropout_rng=dropout_rng)
+    state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adafactor, dropout_rng=dropout_rng)
 
     # label smoothed cross entropy
     def loss_fn(logits, labels, padding_mask, label_smoothing_factor=0.0):
@@ -651,7 +684,7 @@ def main():
 
         grad_fn = jax.value_and_grad(compute_loss)
         loss, grad = grad_fn(state.params)
-        grad = jax.lax.pmean(grad, "batch")
+        # grad = jax.lax.pmean(grad, "batch")
 
         new_state = state.apply_gradients(grads=grad, dropout_rng=new_dropout_rng)
 
@@ -698,26 +731,36 @@ def main():
     logger.info(f"  Num Epochs = {num_epochs}")
     logger.info(f"  Instantaneous batch size per device = {training_args.per_device_train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel & distributed) = {train_batch_size}")
-    logger.info(f"  Total optimization steps = {total_train_steps}")
+    logger.info(f"  Total optimization steps = {opt_steps_per_epoch}")
 
     train_time = 0
     epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
+    pbar = iter(tqdm(range(total_opt_steps), total=total_opt_steps))
+    train_metrics = []
     for epoch in epochs:
         # ======================== Training ================================
         train_start = time.time()
 
         # Create sampling rng
         rng, input_rng = jax.random.split(rng)
-        train_metrics = []
 
         # Generate an epoch by shuffling sampling indices from the train dataset
         train_loader = data_loader(input_rng, train_dataset, train_batch_size, shuffle=True)
-        steps_per_epoch = len(train_dataset) // train_batch_size
         # train
-        for _ in tqdm(range(steps_per_epoch), desc="Training...", position=1, leave=False):
+        for step in range(steps_per_epoch):
             batch = next(train_loader)
+            cur_step = epoch * (len(train_dataset) // opt_train_batch_size) + (
+                        step // training_args.gradient_accumulation_steps)
             state, train_metric = p_train_step(state, batch)
             train_metrics.append(train_metric)
+            if (step+1) % training_args.gradient_accumulation_steps == 0:
+                _ = next(pbar)
+                if cur_step % training_args.logging_steps == 0 and cur_step > 0:
+                    train_metrics = get_metrics(train_metrics)
+                    logger.info(
+                        f"Step... ({cur_step} | Loss: {train_metrics['loss'].mean()}, Learning Rate: {train_metrics['learning_rate'].mean()})",
+                    )
+                    train_metrics = []
 
         train_time += time.time() - train_start
 
@@ -774,8 +817,6 @@ def main():
             params = jax.device_get(jax.tree_map(lambda x: x[0], state.params))
             model.save_pretrained(training_args.output_dir, params=params)
             tokenizer.save_pretrained(training_args.output_dir)
-            if training_args.push_to_hub:
-                repo.push_to_hub(commit_message=f"Saving weights and logs of epoch {epoch}", blocking=False)
 
     # ======================== Prediction loop ==============================
     if training_args.do_predict:
